@@ -1,0 +1,393 @@
+/*
+ * Pickle - GPU-accelerated Video Player for Raspberry Pi 4
+ * 
+ * This program implements a zero-copy video playback pipeline using:
+ * - libavformat for MP4 demuxing
+ * - V4L2 M2M for hardware H.264 decode
+ * - OpenGL ES 3.2 for GPU rendering with keystone correction
+ * - DRM/KMS for direct display output
+ * 
+ * Architecture is modular to allow independent replace    /* Clean shutdown */
+    cleanup_pipeline();
+    restore_terminal();
+    
+    if (ret < 0) {
+        printf("Playback completed with errors\n");
+        return EXIT_FAILURE;
+    }
+    
+    printf("Playbook completed successfully\n");
+    return EXIT_SUCCESS;mponents.
+ * Test with: ./pickle rpi4-e.mp4
+ */
+
+#define _DEFAULT_SOURCE  /* For usleep() */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <termios.h>
+#include <fcntl.h>
+
+/* For usleep() */
+#define _DEFAULT_SOURCE
+
+#include "video_input.h"
+#include "hw_decoder.h"
+#include "gpu_renderer.h"
+#include "display_output.h"
+#include "warp_control.h"
+#include "fallback.h"
+
+/* Global state for cleanup on signal */
+static struct {
+    video_input_ctx_t *input_ctx;
+    hw_decoder_ctx_t *decoder_ctx;
+    gpu_renderer_ctx_t *renderer_ctx;
+    display_output_ctx_t *display_ctx;
+    warp_control_ctx_t *warp_ctx;
+    int running;
+} g_player_state = {0};
+
+/* Terminal state for keyboard input */
+static struct termios original_termios;
+static int terminal_configured = 0;
+
+/* Signal handler for clean shutdown */
+static void signal_handler(int sig) {
+    printf("\nReceived signal %d, shutting down...\n", sig);
+    g_player_state.running = 0;
+    
+    /* Restore terminal settings */
+    restore_terminal();
+    
+    /* Create stop signal file for fallback player */
+    FILE *stop_file = fopen("/tmp/pickle_stop", "w");
+    if (stop_file) {
+        fprintf(stop_file, "stop\n");
+        fclose(stop_file);
+    }
+}
+
+/* Print usage information */
+static void print_usage(const char *prog_name) {
+    printf("Usage: %s <video_file.mp4>\n", prog_name);
+    printf("       %s rpi4-e.mp4  (for testing)\n", prog_name);
+    printf("\nPickle - GPU-accelerated video player for Raspberry Pi 4\n");
+    printf("Features:\n");
+    printf("  - Hardware H.264 decode via V4L2 M2M\n");
+    printf("  - GPU rendering with OpenGL ES 3.2\n");
+    printf("  - Real-time keystone correction\n");
+    printf("  - Zero-copy pipeline for minimal CPU usage\n");
+    printf("  - DRM/KMS output at 1920x1080@60Hz\n");
+    printf("\nRuntime controls:\n");
+    printf("  - Arrow keys: adjust keystone corners\n");
+    printf("  - R: reset warp to identity\n");
+    printf("  - Q/ESC: quit\n");
+}
+
+/* Configure terminal for non-blocking keyboard input */
+static void configure_terminal(void) {
+    if (tcgetattr(STDIN_FILENO, &original_termios) == -1) {
+        return; /* Not a terminal, skip keyboard setup */
+    }
+    
+    struct termios raw = original_termios;
+    raw.c_lflag &= ~(ICANON | ECHO);  /* Disable canonical mode and echo */
+    raw.c_cc[VMIN] = 0;   /* Non-blocking read */
+    raw.c_cc[VTIME] = 0;  /* No timeout */
+    
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0) {
+        terminal_configured = 1;
+    }
+}
+
+/* Restore original terminal settings */
+static void restore_terminal(void) {
+    if (terminal_configured) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);
+        terminal_configured = 0;
+    }
+}
+
+/* Check for keyboard input (non-blocking) */
+static char check_keyboard(void) {
+    if (!terminal_configured) return 0;
+    
+    char c = 0;
+    if (read(STDIN_FILENO, &c, 1) == 1) {
+        return c;
+    }
+    return 0;
+}
+
+/* Initialize all pipeline modules in sequence */
+static int init_pipeline(const char *video_file) {
+    int ret = 0;
+    
+    /* 1. Initialize video input and demuxer */
+    printf("Initializing video input...\n");
+    g_player_state.input_ctx = video_input_create();
+    if (!g_player_state.input_ctx) {
+        fprintf(stderr, "Failed to create video input context\n");
+        return -1;
+    }
+    
+    ret = video_input_open(g_player_state.input_ctx, video_file);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to open video file: %s\n", video_file);
+        return ret;
+    }
+    
+    /* 2. Initialize hardware decoder */
+    printf("Initializing hardware decoder...\n");
+    g_player_state.decoder_ctx = hw_decoder_create();
+    if (!g_player_state.decoder_ctx) {
+        fprintf(stderr, "Failed to create hardware decoder context\n");
+        return -1;
+    }
+    
+    video_stream_info_t stream_info;
+    video_input_get_stream_info(g_player_state.input_ctx, &stream_info);
+    
+    ret = hw_decoder_configure(g_player_state.decoder_ctx, &stream_info);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to configure hardware decoder\n");
+        return ret;
+    }
+    
+    /* 3. Initialize display output */
+    printf("Initializing display output...\n");
+    g_player_state.display_ctx = display_output_create();
+    if (!g_player_state.display_ctx) {
+        fprintf(stderr, "Failed to create display output context\n");
+        return -1;
+    }
+    
+    ret = display_output_configure(g_player_state.display_ctx, 1920, 1080, 60);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to configure display output\n");
+        return ret;
+    }
+    
+    /* 4. Initialize GPU renderer */
+    printf("Initializing GPU renderer...\n");
+    g_player_state.renderer_ctx = gpu_renderer_create();
+    if (!g_player_state.renderer_ctx) {
+        fprintf(stderr, "Failed to create GPU renderer context\n");
+        return -1;
+    }
+    
+    ret = gpu_renderer_configure(g_player_state.renderer_ctx, 
+                                g_player_state.display_ctx,
+                                stream_info.width, stream_info.height);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to configure GPU renderer\n");
+        return ret;
+    }
+    
+    /* 5. Initialize warp control */
+    printf("Initializing warp control...\n");
+    g_player_state.warp_ctx = warp_control_create();
+    if (!g_player_state.warp_ctx) {
+        fprintf(stderr, "Failed to create warp control context\n");
+        return -1;
+    }
+    
+    ret = warp_control_configure(g_player_state.warp_ctx, g_player_state.renderer_ctx);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to configure warp control\n");
+        return ret;
+    }
+    
+    printf("Pipeline initialization complete!\n");
+    return 0;
+}
+
+/* Cleanup all pipeline modules */
+static void cleanup_pipeline(void) {
+    printf("Cleaning up pipeline...\n");
+    
+    if (g_player_state.warp_ctx) {
+        warp_control_destroy(g_player_state.warp_ctx);
+        g_player_state.warp_ctx = NULL;
+    }
+    
+    if (g_player_state.renderer_ctx) {
+        gpu_renderer_destroy(g_player_state.renderer_ctx);
+        g_player_state.renderer_ctx = NULL;
+    }
+    
+    if (g_player_state.display_ctx) {
+        display_output_destroy(g_player_state.display_ctx);
+        g_player_state.display_ctx = NULL;
+    }
+    
+    if (g_player_state.decoder_ctx) {
+        hw_decoder_destroy(g_player_state.decoder_ctx);
+        g_player_state.decoder_ctx = NULL;
+    }
+    
+    if (g_player_state.input_ctx) {
+        video_input_destroy(g_player_state.input_ctx);
+        g_player_state.input_ctx = NULL;
+    }
+    
+    printf("Cleanup complete.\n");
+}
+
+/* Main playback loop with zero-copy frame processing */
+static int run_playback_loop(void) {
+    int ret = 0;
+    frame_packet_t packet = {0};
+    decoded_frame_t frame = {0};
+    
+    printf("Starting playback loop...\n");
+    g_player_state.running = 1;
+    
+    while (g_player_state.running) {
+        /* 1. Read next packet from input */
+        ret = video_input_read_packet(g_player_state.input_ctx, &packet);
+        if (ret == VIDEO_INPUT_EOF) {
+            printf("End of file reached\n");
+            break;
+        } else if (ret < 0) {
+            fprintf(stderr, "Error reading packet: %d\n", ret);
+            break;
+        }
+        
+        /* 2. Submit packet to hardware decoder */
+        ret = hw_decoder_submit_packet(g_player_state.decoder_ctx, &packet);
+        if (ret < 0) {
+            fprintf(stderr, "Error submitting packet to decoder: %d\n", ret);
+            video_input_free_packet(&packet);
+            continue;
+        }
+        
+        /* 3. Get decoded frame (with DMABUF handle) */
+        ret = hw_decoder_get_frame(g_player_state.decoder_ctx, &frame);
+        if (ret < 0) {
+            if (ret != HW_DECODER_EAGAIN) {
+                fprintf(stderr, "Error getting decoded frame: %d\n", ret);
+            }
+            video_input_free_packet(&packet);
+            continue;
+        }
+        
+        /* 4. Process warp control input (non-blocking) */
+        warp_control_process_input(g_player_state.warp_ctx);
+        
+        /* 5. Check for quit key (q or Q) */
+        char key = check_keyboard();
+        if (key == 'q' || key == 'Q' || key == 27) { /* 27 = ESC */
+            printf("Quit requested by user\n");
+            g_player_state.running = 0;
+            break;
+        }
+        
+        /* 6. Render frame with current warp parameters */
+        ret = gpu_renderer_render_frame(g_player_state.renderer_ctx, &frame);
+        if (ret < 0) {
+            fprintf(stderr, "Error rendering frame: %d\n", ret);
+        }
+        
+        /* 7. Present to display */
+        ret = display_output_present_frame(g_player_state.display_ctx);
+        if (ret < 0) {
+            fprintf(stderr, "Error presenting frame: %d\n", ret);
+        }
+        
+        /* Clean up frame resources */
+        hw_decoder_release_frame(g_player_state.decoder_ctx, &frame);
+        video_input_free_packet(&packet);
+        
+        /* Basic frame rate control (will be improved with proper timing) */
+        usleep(16667); // ~60 FPS
+    }
+    
+    return 0;
+}
+
+/* Attempt fallback to libmpv if hardware pipeline fails */
+static int try_fallback_playback(const char *video_file) {
+    printf("Attempting fallback to libmpv...\n");
+    
+    fallback_ctx_t *fallback_ctx = fallback_create();
+    if (!fallback_ctx) {
+        fprintf(stderr, "Failed to create fallback context\n");
+        return -1;
+    }
+    
+    /* Configure fallback for better responsiveness */
+    fallback_config_t config = {
+        .enable_hardware_decode = 0,  /* Use software decode for compatibility */
+        .enable_audio = 1,
+        .vo_driver = "gpu",
+        .hwdec = NULL,
+        .loop_file = 0
+    };
+    
+    fallback_set_config(fallback_ctx, &config);
+    
+    int ret = fallback_play_file(fallback_ctx, video_file);
+    if (ret < 0) {
+        fprintf(stderr, "Fallback playback also failed\n");
+    }
+    
+    fallback_destroy(fallback_ctx);
+    return ret;
+}
+
+int main(int argc, char *argv[]) {
+    int ret = 0;
+    
+    /* Parse command line arguments */
+    if (argc != 2) {
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    
+    const char *video_file = argv[1];
+    
+    /* Check if file exists */
+    if (access(video_file, R_OK) != 0) {
+        fprintf(stderr, "Error: Cannot read file '%s': %s\n", 
+                video_file, strerror(errno));
+        return EXIT_FAILURE;
+    }
+    
+    /* Set up signal handlers for clean shutdown */
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    /* Configure terminal for keyboard input */
+    configure_terminal();
+    
+    printf("Pickle starting with file: %s\n", video_file);
+    
+    /* Initialize the complete pipeline */
+    ret = init_pipeline(video_file);
+    if (ret < 0) {
+        fprintf(stderr, "Pipeline initialization failed, trying fallback...\n");
+        cleanup_pipeline();
+        return try_fallback_playback(video_file);
+    }
+    
+    /* Run the main playback loop */
+    ret = run_playback_loop();
+    
+    /* Clean shutdown */
+    cleanup_pipeline();
+    restore_terminal();
+    
+    if (ret < 0) {
+        printf("Playback completed with errors\n");
+        return EXIT_FAILURE;
+    }
+    
+    printf("Playback completed successfully\n");
+    return EXIT_SUCCESS;
+}
