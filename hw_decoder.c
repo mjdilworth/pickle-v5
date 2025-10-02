@@ -201,13 +201,13 @@ int hw_decoder_submit_packet(hw_decoder_ctx_t *ctx, const frame_packet_t *packet
                           (end_time.tv_usec - start_time.tv_usec);
     ctx->total_decode_time_us += decode_time;
     
-    /* FFmpeg h264_v4l2m2m typically accepts packets immediately but needs time to produce frames.
+    /* FFmpeg decoder typically accepts packets immediately but needs time to produce frames.
      * For the first few packets, frames may not be immediately available. */
     static int packet_count = 0;
     packet_count++;
     if (packet_count <= 3) {
-        printf("✓ Submitted packet %d (%s: %d bytes) to h264_v4l2m2m decoder\n", 
-               packet_count, packet->keyframe ? "keyframe" : "P-frame", packet->size);
+        printf("✓ Submitted packet %d (%s: %d bytes) to %s decoder\n", 
+               packet_count, packet->keyframe ? "keyframe" : "P-frame", packet->size, ctx->codec_ctx->codec->name);
     }
     
     return HW_DECODER_OK;

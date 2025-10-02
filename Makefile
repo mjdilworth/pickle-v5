@@ -6,9 +6,9 @@ CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2 -g
 TARGET = pickle
 
-# Source files
-SOURCES = pickle.c video_input.c hw_decoder.c gpu_renderer.c display_output.c warp_control.c fallback.c
-HEADERS = video_input.h hw_decoder.h gpu_renderer.h display_output.h warp_control.h fallback.h
+# Source files  
+SOURCES = pickle.c video_input.c hw_decoder.c gpu_renderer.c display_output.c drm_display.c warp_control.c fallback.c
+HEADERS = video_input.h hw_decoder.h gpu_renderer.h display_output.h drm_display.h warp_control.h fallback.h
 
 # Object files
 OBJECTS = $(SOURCES:.c=.o)
